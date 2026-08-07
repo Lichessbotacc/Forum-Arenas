@@ -19,6 +19,8 @@ Erwartetes Format (Beispiel):
     Time: 18:00
     Rated: yes
 
+Clock akzeptiert auch UltraBullet-Bruchwerte: "1/4+0" oder "0.25+0".
+
 State (verarbeitete Post-IDs, letzte Forumsseite, Rate-Limit-Nutzung) wird
 in data/state.json gespeichert. Der Workflow committet diese Datei nach
 jedem Lauf zurück.
@@ -41,7 +43,7 @@ from bs4 import BeautifulSoup, NavigableString
 
 FORUM_SLUG = "team-forum-arenas/arena-requests"
 FORUM_BASE = f"https://lichess.org/forum/{FORUM_SLUG}"
-TEAM_ID = "forum-arenas"                      # <-- echte Team-ID eintragen
+TEAM_ID = "forum-arenas"
 STATE_PATH = Path("data/state.json")
 TOKEN = os.environ.get("LICHESS_TOKEN")
 
@@ -53,7 +55,7 @@ MAX_TOURNAMENTS_PER_USER_PER_DAY = 3
 # automatisch VOR diesen Text gesetzt - hier nur den Rest nach Belieben anpassen.
 DESCRIPTION_TEMPLATE = (
     "Join the Forum Arenas team to take part in community-requested tournaments!\n"
-    "Post your own request in the [Arena Requests](https://lichess.org/forum/team-forum-arenas/arena-requests) forum to get your own arena created."
+    "Post your own request in the [Arena Requests forum](https://lichess.org/forum/team-forum-arenas/arena-requests) to get your own arena created."
 )
 
 VARIANT_MAP = {
@@ -75,7 +77,14 @@ VARIANT_MAP = {
     "3check": "threeCheck",
 }
 
+# Von Lichess erlaubte clockTime-Werte (Minuten), inkl. UltraBullet-Bruchwerte
+ALLOWED_CLOCK_TIMES = {
+    0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    15, 20, 25, 30, 40, 50, 60,
+}
+
 POST_LINK_RE = re.compile(r"^/@/([\w-]+)$")
+# ?page=N ist optional - auf Seite 1 lässt Lichess den Query-Parameter weg
 PERMALINK_RE = re.compile(r"(?:\?page=\d+)?#([A-Za-z0-9]+)$")
 
 session = requests.Session()
@@ -104,7 +113,7 @@ def extract_posts(html: str):
     [{username, post_id, text}] in Reihenfolge des Auftretens.
 
     Robuster Ansatz: ein echter Post-Header ist ein Link auf /@/USERNAME,
-    DIREKT gefolgt (nächstes <a>-Tag) von einem Link auf .../?page=N#POSTID.
+    DIREKT gefolgt (nächstes <a>-Tag) von einem Link auf .../[?page=N]#POSTID.
     Mentions im Fließtext (z.B. "@DarkOnCrack") erfüllen dieses Muster nicht,
     weil danach kein Permalink-Link folgt. <blockquote>-Elemente (zitierte
     Antworten) werden vorher entfernt, damit Inhalte aus zitiertem Text nicht
@@ -166,6 +175,31 @@ def parse_fields(text: str) -> dict:
     return fields
 
 
+def parse_clock_time(raw: str) -> float:
+    """Akzeptiert '3', '0.25' oder '1/4' (Bruch) als Minutenangabe."""
+    raw = raw.strip()
+
+    frac_match = re.match(r"^(\d+)\s*/\s*(\d+)$", raw)
+    if frac_match:
+        numerator, denominator = int(frac_match.group(1)), int(frac_match.group(2))
+        if denominator == 0:
+            raise ValueError("division by zero")
+        return numerator / denominator
+
+    dec_match = re.match(r"^\d+(\.\d+)?$", raw)
+    if dec_match:
+        return float(raw)
+
+    raise ValueError(f"unrecognized number format '{raw}'")
+
+
+def format_clock_time(value: float) -> str:
+    """Gibt ganze Zahlen ohne .0 zurück, sonst den Dezimalwert (z.B. 0.25)."""
+    if value == int(value):
+        return str(int(value))
+    return str(value)
+
+
 def parse_request(text: str) -> dict:
     """Wirft ValidationError mit verständlicher Meldung, wenn etwas fehlt/ungültig ist."""
     fields = parse_fields(text)
@@ -195,17 +229,35 @@ def parse_request(text: str) -> dict:
             f"King of the Hill, Racing Kings, Three-check."
         )
 
-    # --- Clock (z.B. "3+2") ---
-    m = re.match(r"^(\d+)\s*\+\s*(\d+)$", fields["clock"].strip())
-    if not m:
+    # --- Clock (z.B. "3+2", "1/4+0", "0.25+0" für UltraBullet) ---
+    clock_match = re.match(r"^(.+?)\s*\+\s*(\d+)$", fields["clock"].strip())
+    if not clock_match:
         raise ValidationError(
             f"invalid 'Clock' value '{fields['clock']}'. "
-            f"Use the format MINUTES+INCREMENT, e.g. '3+2' or '5+0'."
+            f"Use the format TIME+INCREMENT, e.g. '3+2', '5+0', or '1/4+0' / '0.25+0' for UltraBullet."
         )
-    clock_time = int(m.group(1))
-    clock_increment = int(m.group(2))
-    if not (0 < clock_time <= 60) or not (0 <= clock_increment <= 60):
-        raise ValidationError("'Clock' values out of allowed range (time 1-60, increment 0-60).")
+
+    try:
+        clock_time = parse_clock_time(clock_match.group(1))
+    except ValueError:
+        raise ValidationError(
+            f"invalid 'Clock' time value '{clock_match.group(1)}'. "
+            f"Use a whole number, a decimal (e.g. 0.25), or a fraction (e.g. 1/4)."
+        )
+
+    clock_increment = int(clock_match.group(2))
+
+    if not any(abs(clock_time - allowed) < 0.001 for allowed in ALLOWED_CLOCK_TIMES):
+        allowed_str = ", ".join(
+            str(int(v)) if v == int(v) else str(v) for v in sorted(ALLOWED_CLOCK_TIMES)
+        )
+        raise ValidationError(
+            f"invalid 'Clock' time '{clock_match.group(1)}'. Allowed values: {allowed_str} "
+            f"(minutes; use 1/4 or 0.25 for UltraBullet)."
+        )
+
+    if not (0 <= clock_increment <= 60):
+        raise ValidationError("'Clock' increment out of allowed range (0-60).")
 
     # --- Duration (Minuten) ---
     if not re.match(r"^\d+$", fields["duration"].strip()):
@@ -249,7 +301,7 @@ def parse_request(text: str) -> dict:
     return {
         "name": name,
         "variant": variant,
-        "clockTime": clock_time,
+        "clockTime": clock_time,        # float (z.B. 0.25 für UltraBullet)
         "clockIncrement": clock_increment,
         "duration": duration,
         "start": start,
@@ -293,7 +345,7 @@ def create_tournament(req: dict, requester: str) -> dict:
 
     data = {
         "name": req["name"],
-        "clockTime": str(req["clockTime"]),
+        "clockTime": format_clock_time(req["clockTime"]),
         "clockIncrement": str(req["clockIncrement"]),
         "minutes": str(req["duration"]),
         "startDate": str(start_millis),
@@ -304,7 +356,7 @@ def create_tournament(req: dict, requester: str) -> dict:
     }
 
     print(f'-> Creating "{req["name"]}" ({req["variant"]}, '
-          f'{req["clockTime"]}+{req["clockIncrement"]}, {req["duration"]}min) '
+          f'{format_clock_time(req["clockTime"])}+{req["clockIncrement"]}, {req["duration"]}min) '
           f'for {req["start"].strftime("%d.%m.%Y %H:%M")} (Berlin)')
 
     res = session.post("https://lichess.org/api/tournament", data=data, timeout=30)
