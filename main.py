@@ -5,9 +5,8 @@ Lichess Forum Arenas Bot
 Team "Forum Arenas" / Forum "Arena Requests"
 
 Spieler posten ein strukturiertes Key:Value-Template im Forum. Der Bot liest
-neue Posts, parst/validiert die Felder, prüft das Rate-Limit, erstellt ein
-Lichess-Arena-Turnier mit exakt diesen Einstellungen und antwortet im Thread
-mit Bestätigung (Link) oder einer Fehlermeldung.
+neue Posts, parst/validiert die Felder, prüft das Rate-Limit und erstellt ein
+Lichess-Arena-Turnier mit exakt diesen Einstellungen.
 
 Erwartetes Format (Beispiel):
 
@@ -33,7 +32,7 @@ import re
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup, NavigableString
@@ -51,6 +50,12 @@ TOKEN = os.environ.get("LICHESS_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
 
 MAX_TOURNAMENTS_PER_USER_PER_DAY = 3
+
+# Mindest-Vorlaufzeit zwischen "jetzt" (Verarbeitungszeitpunkt) und Turnierstart.
+# Verhindert, dass knapp getimte Anfragen durch die Verzögerung zwischen
+# Posten und Cron-Durchlauf fälschlich als "in der Vergangenheit" abgelehnt
+# werden bzw. dass Lichess den Request wegen zu kurzer Vorlaufzeit ablehnt.
+MIN_LEAD_MINUTES = 15
 
 # Feste Turnier-Beschreibung. "This arena was requested by @Username" wird
 # automatisch VOR diesen Text gesetzt - hier nur den Rest nach Belieben anpassen.
@@ -114,12 +119,12 @@ def extract_posts(html: str):
     """
     [{username, post_id, text}] in Reihenfolge des Auftretens.
 
-    Robuster Ansatz: ein echter Post-Header ist ein Link auf /@/USERNAME,
-    DIREKT gefolgt (nächstes <a>-Tag) von einem Link auf .../[?page=N]#POSTID.
-    Mentions im Fließtext (z.B. "@DarkOnCrack") erfüllen dieses Muster nicht,
-    weil danach kein Permalink-Link folgt. <blockquote>-Elemente (zitierte
-    Antworten) werden vorher entfernt, damit Inhalte aus zitiertem Text nicht
-    fälschlich dem Antwortenden zugeschrieben werden.
+    Ein echter Post-Header ist ein Link auf /@/USERNAME, DIREKT gefolgt
+    (nächstes <a>-Tag) von einem Link auf .../[?page=N]#POSTID. Mentions im
+    Fließtext (z.B. "@DarkOnCrack") erfüllen dieses Muster nicht, weil danach
+    kein Permalink-Link folgt. <blockquote>-Elemente (zitierte Antworten)
+    werden vorher entfernt, damit Inhalte aus zitiertem Text nicht fälschlich
+    dem Antwortenden zugeschrieben werden.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -222,17 +227,18 @@ def parse_request(text: str) -> dict:
     name = re.sub(r"[^a-zA-Z0-9 ]", "", raw_name)
     name = re.sub(r"\s+", " ", name).strip()
 
-    if not name:
+    if len(name) < 2:
         raise ValidationError(
-            "'Name' contains no usable characters after removing special "
-            "characters/symbols. Please use letters and numbers."
+            "'Name' must contain at least 2 usable letters/numbers after "
+            "removing special characters/symbols."
         )
     if len(name) > 30:
         name = name[:30].rstrip()
 
-    # --- Variant ---
-    variant_raw = fields["variant"].strip().lower()
-    variant = VARIANT_MAP.get(variant_raw)
+    # --- Variant --- (tolerant gegenüber Satzzeichen/Extra-Leerzeichen)
+    variant_clean = re.sub(r"[^a-z0-9 ]", " ", fields["variant"].strip().lower())
+    variant_clean = re.sub(r"\s+", " ", variant_clean).strip()
+    variant = VARIANT_MAP.get(variant_clean) or VARIANT_MAP.get(variant_clean.replace(" ", ""))
     if variant is None:
         raise ValidationError(
             f"unknown variant '{fields['variant']}'. Valid options: "
@@ -300,10 +306,12 @@ def parse_request(text: str) -> dict:
         raise ValidationError(f"'{date_str} {time_str}' is not a valid date/time.")
 
     now = datetime.now(TZ)
-    if start <= now:
+    min_start = now + timedelta(minutes=MIN_LEAD_MINUTES)
+    if start < min_start:
         raise ValidationError(
-            f"the requested start ({start.strftime('%d.%m.%Y %H:%M')} German time) "
-            f"is in the past. Please choose a future date/time."
+            f"the requested start ({start.strftime('%d.%m.%Y %H:%M')} German time) is too soon "
+            f"or in the past. Please choose a time at least {MIN_LEAD_MINUTES} minutes from now "
+            f"to account for processing delay."
         )
 
     # --- Rated ---
@@ -383,40 +391,6 @@ def create_tournament(req: dict, requester: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Forum-Antwort posten (EXPERIMENTELL - keine offizielle API)
-# ---------------------------------------------------------------------------
-
-def post_forum_reply(message: str) -> bool:
-    try:
-        form_res = session.get(FORUM_BASE, timeout=30)
-        form_res.raise_for_status()
-
-        csrf_match = re.search(r'name="csrfToken"[^>]*value="([^"]+)"', form_res.text)
-        if not csrf_match:
-            print("   ! Could not find CSRF token, skipping forum reply.")
-            return False
-        csrf_token = csrf_match.group(1)
-
-        reply_res = session.post(
-            f"{FORUM_BASE}/reply",
-            data={"text": message, "csrfToken": csrf_token},
-            headers={"Referer": FORUM_BASE},
-            timeout=30,
-        )
-
-        if reply_res.ok:
-            print("   ✓ Forum reply posted.")
-            return True
-
-        print(f"   ! Forum reply failed ({reply_res.status_code}).")
-        return False
-
-    except Exception as e:
-        print(f"   ! Forum reply failed ({e}).")
-        return False
-
-
-# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -473,11 +447,12 @@ def main():
             req = parse_request(post["text"])
         except ValidationError as e:
             print(f"   ✗ Invalid request: {e}")
-            msg = (
-                f"@{username} ❌ Your arena request couldn't be created: {e}\n\n"
-                f"Please check the pinned template and post a corrected request."
-            )
-            post_forum_reply(msg)
+            state["processedIds"].append(post["post_id"])
+            continue
+        except Exception as e:
+            # Absicherung gegen unerwartete Parsing-Fehler, damit ein einzelner
+            # kaputter Post nicht den ganzen Workflow-Lauf abbrechen lässt.
+            print(f"   ✗ Unexpected parsing error: {e}", file=sys.stderr)
             state["processedIds"].append(post["post_id"])
             continue
 
@@ -485,32 +460,15 @@ def main():
         used = user_tournament_count_today(state, username)
         if used >= MAX_TOURNAMENTS_PER_USER_PER_DAY:
             print(f"   ✗ Rate limit reached ({used}/{MAX_TOURNAMENTS_PER_USER_PER_DAY} today)")
-            msg = (
-                f"@{username} ❌ You've reached the daily limit of "
-                f"{MAX_TOURNAMENTS_PER_USER_PER_DAY} arenas per user. "
-                f"Please try again tomorrow."
-            )
-            post_forum_reply(msg)
             state["processedIds"].append(post["post_id"])
             continue
 
         # --- Turnier erstellen ---
         try:
-            tournament = create_tournament(req, username)
+            create_tournament(req, username)
             record_tournament_created(state, username)
-            url = f"https://lichess.org/tournament/{tournament['id']}"
-            remaining = MAX_TOURNAMENTS_PER_USER_PER_DAY - user_tournament_count_today(state, username)
-            msg = (
-                f"@{username} ✅ Your arena \"{req['name']}\" was created: {url}\n"
-                f"(You have {remaining} arena request(s) left today.)"
-            )
-            post_forum_reply(msg)
         except Exception as e:
             print(f"   ✗ Error creating tournament: {e}", file=sys.stderr)
-            post_forum_reply(
-                f"@{username} ❌ Something went wrong creating your arena. "
-                f"Please try again or contact a team leader."
-            )
 
         state["processedIds"].append(post["post_id"])
 
