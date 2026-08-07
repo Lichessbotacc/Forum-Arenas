@@ -39,7 +39,7 @@ from bs4 import BeautifulSoup, NavigableString
 # Konfiguration
 # ---------------------------------------------------------------------------
 
-FORUM_SLUG = "forum-arenas/arena-requests"   # <-- ggf. an echten Slug anpassen
+FORUM_SLUG = "team-forum-arenas/arena-requests"
 FORUM_BASE = f"https://lichess.org/forum/{FORUM_SLUG}"
 TEAM_ID = "forum-arenas"                      # <-- echte Team-ID eintragen
 STATE_PATH = Path("data/state.json")
