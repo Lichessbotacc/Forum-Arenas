@@ -76,7 +76,7 @@ VARIANT_MAP = {
 }
 
 POST_LINK_RE = re.compile(r"^/@/([\w-]+)$")
-re.compile(r"(?:\?page=\d+)?#([A-Za-z0-9]+)$")
+PERMALINK_RE = re.compile(r"(?:\?page=\d+)?#([A-Za-z0-9]+)$")
 
 session = requests.Session()
 session.headers.update({"User-Agent": "forum-arenas-bot"})
