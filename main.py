@@ -53,7 +53,7 @@ MAX_TOURNAMENTS_PER_USER_PER_DAY = 3
 # automatisch VOR diesen Text gesetzt - hier nur den Rest nach Belieben anpassen.
 DESCRIPTION_TEMPLATE = (
     "Join the Forum Arenas team to take part in community-requested tournaments!\n"
-    "Post your own request in the Arena Requests forum to get your own arena created."
+    "Post your own request in the [Arena Requests](https://lichess.org/forum/team-forum-arenas/arena-requests) forum to get your own arena created."
 )
 
 VARIANT_MAP = {
