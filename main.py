@@ -212,13 +212,21 @@ def parse_request(text: str) -> dict:
             f"Please use the exact template (see pinned post)."
         )
 
-    # --- Name ---
-    name = fields["name"].strip()
-    if not name:
-        raise ValidationError("'Name' cannot be empty.")
-    if len(name) > 30:
-        name = name[:30]
+   # --- Name ---
+raw_name = fields["name"].strip()
+# Nur Buchstaben, Zahlen und Leerzeichen erlaubt (Lichess-Einschränkung für
+# Turniernamen) - alles andere (!!!, ?, Emojis, Sonderzeichen usw.) wird
+# stillschweigend entfernt statt einen Error zu werfen.
+name = re.sub(r"[^a-zA-Z0-9 ]", "", raw_name)
+name = re.sub(r"\s+", " ", name).strip()
 
+if not name:
+    raise ValidationError(
+        "'Name' contains no usable characters after removing special "
+        "characters/symbols. Please use letters and numbers."
+    )
+if len(name) > 30:
+    name = name[:30].rstrip()
     # --- Variant ---
     variant_raw = fields["variant"].strip().lower()
     variant = VARIANT_MAP.get(variant_raw)
