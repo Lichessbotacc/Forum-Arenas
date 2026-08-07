@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Lichess Custom-Arena-Bot
+Lichess Forum Arenas Bot
 =========================
 Team "Forum Arenas" / Forum "Arena Requests"
 
 Spieler posten ein strukturiertes Key:Value-Template im Forum. Der Bot liest
-neue Posts, parst/validiert die Felder, erstellt ein Lichess-Arena-Turnier
-mit exakt diesen Einstellungen und antwortet im Thread mit Bestätigung
-(Link) oder einer Fehlermeldung, falls das Format ungültig war.
+neue Posts, parst/validiert die Felder, prüft das Rate-Limit, erstellt ein
+Lichess-Arena-Turnier mit exakt diesen Einstellungen und antwortet im Thread
+mit Bestätigung (Link) oder einer Fehlermeldung.
 
 Erwartetes Format (Beispiel):
 
@@ -19,8 +19,9 @@ Erwartetes Format (Beispiel):
     Time: 18:00
     Rated: yes
 
-State (verarbeitete Post-IDs, letzte Forumsseite) wird in data/state.json
-gespeichert. Der Workflow committet diese Datei nach jedem Lauf zurück.
+State (verarbeitete Post-IDs, letzte Forumsseite, Rate-Limit-Nutzung) wird
+in data/state.json gespeichert. Der Workflow committet diese Datei nach
+jedem Lauf zurück.
 """
 
 import json
@@ -45,6 +46,15 @@ STATE_PATH = Path("data/state.json")
 TOKEN = os.environ.get("LICHESS_TOKEN")
 
 TZ = ZoneInfo("Europe/Berlin")
+
+MAX_TOURNAMENTS_PER_USER_PER_DAY = 3
+
+# Feste Turnier-Beschreibung. "This arena was requested by @Username" wird
+# automatisch VOR diesen Text gesetzt - hier nur den Rest nach Belieben anpassen.
+DESCRIPTION_TEMPLATE = (
+    "Join the Forum Arenas team to take part in community-requested tournaments!\n"
+    "Post your own request in the Arena Requests forum to get your own arena created."
+)
 
 VARIANT_MAP = {
     "standard": "standard",
@@ -75,7 +85,7 @@ if TOKEN:
 
 
 # ---------------------------------------------------------------------------
-# Forum scrapen (Lesen) - gleiche robuste Logik wie im Birthday-Bot
+# Forum scrapen (Lesen)
 # ---------------------------------------------------------------------------
 
 def fetch_page(page: int) -> str:
@@ -90,7 +100,16 @@ def get_max_page(html: str) -> int:
 
 
 def extract_posts(html: str):
-    """[{username, post_id, text}] - robust gegen Mentions/Zitate im Text."""
+    """
+    [{username, post_id, text}] in Reihenfolge des Auftretens.
+
+    Robuster Ansatz: ein echter Post-Header ist ein Link auf /@/USERNAME,
+    DIREKT gefolgt (nächstes <a>-Tag) von einem Link auf .../?page=N#POSTID.
+    Mentions im Fließtext (z.B. "@DarkOnCrack") erfüllen dieses Muster nicht,
+    weil danach kein Permalink-Link folgt. <blockquote>-Elemente (zitierte
+    Antworten) werden vorher entfernt, damit Inhalte aus zitiertem Text nicht
+    fälschlich dem Antwortenden zugeschrieben werden.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     for bq in soup.find_all("blockquote"):
@@ -98,7 +117,7 @@ def extract_posts(html: str):
 
     all_links = soup.find_all("a", href=True)
 
-    headers = []
+    headers = []  # (anchor_tag, username, post_id)
     for i, a in enumerate(all_links):
         m = POST_LINK_RE.match(a["href"])
         if not m:
@@ -117,7 +136,7 @@ def extract_posts(html: str):
         anchor.insert_after(NavigableString(marker))
 
     full_text = soup.get_text("\n")
-    chunks = full_text.split(marker)[1:]
+    chunks = full_text.split(marker)[1:]  # erstes Element = Text vor dem 1. Post
 
     posts = []
     for (_, username, post_id), chunk in zip(headers, chunks):
@@ -147,7 +166,7 @@ def parse_fields(text: str) -> dict:
     return fields
 
 
-def parse_request(text: str, username: str) -> dict:
+def parse_request(text: str) -> dict:
     """Wirft ValidationError mit verständlicher Meldung, wenn etwas fehlt/ungültig ist."""
     fields = parse_fields(text)
 
@@ -189,8 +208,7 @@ def parse_request(text: str, username: str) -> dict:
         raise ValidationError("'Clock' values out of allowed range (time 1-60, increment 0-60).")
 
     # --- Duration (Minuten) ---
-    m = re.match(r"^\d+$", fields["duration"].strip())
-    if not m:
+    if not re.match(r"^\d+$", fields["duration"].strip()):
         raise ValidationError(f"invalid 'Duration' value '{fields['duration']}'. Must be a number in minutes.")
     duration = int(fields["duration"].strip())
     if not (10 <= duration <= 360):
@@ -240,11 +258,38 @@ def parse_request(text: str, username: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Rate-Limiting (3 Turniere pro Nutzer pro Kalendertag, deutsche Zeit)
+# ---------------------------------------------------------------------------
+
+def today_key() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+def user_tournament_count_today(state: dict, username: str) -> int:
+    day = today_key()
+    usage = state.get("usage", {})
+    user_usage = usage.get(username.lower(), {})
+    return user_usage.get(day, 0)
+
+
+def record_tournament_created(state: dict, username: str):
+    day = today_key()
+    usage = state.setdefault("usage", {})
+    user_usage = usage.setdefault(username.lower(), {})
+    user_usage[day] = user_usage.get(day, 0) + 1
+
+    # alte Tage aufräumen, damit die Datei nicht endlos wächst
+    usage[username.lower()] = {d: c for d, c in user_usage.items() if d == day}
+
+
+# ---------------------------------------------------------------------------
 # Turnier erstellen
 # ---------------------------------------------------------------------------
 
 def create_tournament(req: dict, requester: str) -> dict:
     start_millis = int(req["start"].astimezone(ZoneInfo("UTC")).timestamp() * 1000)
+
+    description = f"This arena was requested by @{requester}\n\n{DESCRIPTION_TEMPLATE}"
 
     data = {
         "name": req["name"],
@@ -255,7 +300,7 @@ def create_tournament(req: dict, requester: str) -> dict:
         "variant": req["variant"],
         "rated": "true" if req["rated"] else "false",
         "conditions.teamMember.teamId": TEAM_ID,
-        "description": f"Custom arena requested by {requester} via the Arena Requests forum.",
+        "description": description,
     }
 
     print(f'-> Creating "{req["name"]}" ({req["variant"]}, '
@@ -311,8 +356,10 @@ def post_forum_reply(message: str) -> bool:
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
-        return {"lastPage": 1, "processedIds": []}
-    return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return {"lastPage": 1, "processedIds": [], "usage": {}}
+    state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    state.setdefault("usage", {})
+    return state
 
 
 def save_state(state: dict):
@@ -355,8 +402,9 @@ def main():
         username = post["username"]
         print(f'Processing post from {username}...')
 
+        # --- Format validieren ---
         try:
-            req = parse_request(post["text"], username)
+            req = parse_request(post["text"])
         except ValidationError as e:
             print(f"   ✗ Invalid request: {e}")
             msg = (
@@ -367,10 +415,29 @@ def main():
             state["processedIds"].append(post["post_id"])
             continue
 
+        # --- Rate-Limit prüfen ---
+        used = user_tournament_count_today(state, username)
+        if used >= MAX_TOURNAMENTS_PER_USER_PER_DAY:
+            print(f"   ✗ Rate limit reached ({used}/{MAX_TOURNAMENTS_PER_USER_PER_DAY} today)")
+            msg = (
+                f"@{username} ❌ You've reached the daily limit of "
+                f"{MAX_TOURNAMENTS_PER_USER_PER_DAY} arenas per user. "
+                f"Please try again tomorrow."
+            )
+            post_forum_reply(msg)
+            state["processedIds"].append(post["post_id"])
+            continue
+
+        # --- Turnier erstellen ---
         try:
             tournament = create_tournament(req, username)
+            record_tournament_created(state, username)
             url = f"https://lichess.org/tournament/{tournament['id']}"
-            msg = f"@{username} ✅ Your arena \"{req['name']}\" was created: {url}"
+            remaining = MAX_TOURNAMENTS_PER_USER_PER_DAY - user_tournament_count_today(state, username)
+            msg = (
+                f"@{username} ✅ Your arena \"{req['name']}\" was created: {url}\n"
+                f"(You have {remaining} arena request(s) left today.)"
+            )
             post_forum_reply(msg)
         except Exception as e:
             print(f"   ✗ Error creating tournament: {e}", file=sys.stderr)
