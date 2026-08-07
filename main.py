@@ -55,7 +55,7 @@ MAX_TOURNAMENTS_PER_USER_PER_DAY = 3
 # Verhindert, dass knapp getimte Anfragen durch die Verzögerung zwischen
 # Posten und Cron-Durchlauf fälschlich als "in der Vergangenheit" abgelehnt
 # werden bzw. dass Lichess den Request wegen zu kurzer Vorlaufzeit ablehnt.
-MIN_LEAD_MINUTES = 15
+MIN_LEAD_MINUTES = 1
 
 # Feste Turnier-Beschreibung. "This arena was requested by @Username" wird
 # automatisch VOR diesen Text gesetzt - hier nur den Rest nach Belieben anpassen.
