@@ -283,9 +283,8 @@ def parse_request(text: str) -> dict:
     if not re.match(r"^\d+$", fields["duration"].strip()):
         raise ValidationError(f"invalid 'Duration' value '{fields['duration']}'. Must be a number in minutes.")
     duration = int(fields["duration"].strip())
-    if not (10 <= duration <= 360):
-        raise ValidationError("'Duration' must be between 10 and 360 minutes.")
-
+    if not (10 <= duration <= 720):
+        raise ValidationError("'Duration' must be between 10 and 720 minutes.")
     # --- Date + Time -> Startdatum in Europe/Berlin ---
     date_str = fields["date"].strip()
     time_str = fields["time"].strip()
