@@ -19,7 +19,8 @@ Erwartetes Format (Beispiel):
     Time: 18:00
     Rated: yes
 
-Clock akzeptiert auch UltraBullet-Bruchwerte: "1/4+0" oder "0.25+0".
+Clock akzeptiert auch UltraBullet-Bruchwerte ("1/4+0" / "0.25+0") und
+reines Inkrement ("0+1").
 
 State (verarbeitete Post-IDs, letzte Forumsseite, Rate-Limit-Nutzung) wird
 in data/state.json gespeichert. Der Workflow committet diese Datei nach
@@ -78,8 +79,9 @@ VARIANT_MAP = {
 }
 
 # Von Lichess erlaubte clockTime-Werte (Minuten), inkl. UltraBullet-Bruchwerte
+# und 0 (reines Inkrement, z.B. "0+1")
 ALLOWED_CLOCK_TIMES = {
-    0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10,
     15, 20, 25, 30, 40, 50, 60,
 }
 
@@ -176,7 +178,7 @@ def parse_fields(text: str) -> dict:
 
 
 def parse_clock_time(raw: str) -> float:
-    """Akzeptiert '3', '0.25' oder '1/4' (Bruch) als Minutenangabe."""
+    """Akzeptiert '3', '0', '0.25' oder '1/4' (Bruch) als Minutenangabe."""
     raw = raw.strip()
 
     frac_match = re.match(r"^(\d+)\s*/\s*(\d+)$", raw)
@@ -212,21 +214,22 @@ def parse_request(text: str) -> dict:
             f"Please use the exact template (see pinned post)."
         )
 
-   # --- Name ---
-raw_name = fields["name"].strip()
-# Nur Buchstaben, Zahlen und Leerzeichen erlaubt (Lichess-Einschränkung für
-# Turniernamen) - alles andere (!!!, ?, Emojis, Sonderzeichen usw.) wird
-# stillschweigend entfernt statt einen Error zu werfen.
-name = re.sub(r"[^a-zA-Z0-9 ]", "", raw_name)
-name = re.sub(r"\s+", " ", name).strip()
+    # --- Name ---
+    raw_name = fields["name"].strip()
+    # Nur Buchstaben, Zahlen und Leerzeichen erlaubt (Lichess-Einschränkung für
+    # Turniernamen) - alles andere (!!!, ?, Emojis, Sonderzeichen usw.) wird
+    # stillschweigend entfernt statt einen Error zu werfen.
+    name = re.sub(r"[^a-zA-Z0-9 ]", "", raw_name)
+    name = re.sub(r"\s+", " ", name).strip()
 
-if not name:
-    raise ValidationError(
-        "'Name' contains no usable characters after removing special "
-        "characters/symbols. Please use letters and numbers."
-    )
-if len(name) > 30:
-    name = name[:30].rstrip()
+    if not name:
+        raise ValidationError(
+            "'Name' contains no usable characters after removing special "
+            "characters/symbols. Please use letters and numbers."
+        )
+    if len(name) > 30:
+        name = name[:30].rstrip()
+
     # --- Variant ---
     variant_raw = fields["variant"].strip().lower()
     variant = VARIANT_MAP.get(variant_raw)
@@ -237,12 +240,12 @@ if len(name) > 30:
             f"King of the Hill, Racing Kings, Three-check."
         )
 
-    # --- Clock (z.B. "3+2", "1/4+0", "0.25+0" für UltraBullet) ---
+    # --- Clock (z.B. "3+2", "0+1", "1/4+0", "0.25+0" für UltraBullet) ---
     clock_match = re.match(r"^(.+?)\s*\+\s*(\d+)$", fields["clock"].strip())
     if not clock_match:
         raise ValidationError(
             f"invalid 'Clock' value '{fields['clock']}'. "
-            f"Use the format TIME+INCREMENT, e.g. '3+2', '5+0', or '1/4+0' / '0.25+0' for UltraBullet."
+            f"Use the format TIME+INCREMENT, e.g. '3+2', '0+1', or '1/4+0' / '0.25+0' for UltraBullet."
         )
 
     try:
@@ -263,6 +266,9 @@ if len(name) > 30:
             f"invalid 'Clock' time '{clock_match.group(1)}'. Allowed values: {allowed_str} "
             f"(minutes; use 1/4 or 0.25 for UltraBullet)."
         )
+
+    if clock_time == 0 and clock_increment == 0:
+        raise ValidationError("'Clock' 0+0 is not allowed - increment must be greater than 0 when time is 0.")
 
     if not (0 <= clock_increment <= 60):
         raise ValidationError("'Clock' increment out of allowed range (0-60).")
@@ -309,7 +315,7 @@ if len(name) > 30:
     return {
         "name": name,
         "variant": variant,
-        "clockTime": clock_time,        # float (z.B. 0.25 für UltraBullet)
+        "clockTime": clock_time,        # float (z.B. 0.25 für UltraBullet, 0 für reines Inkrement)
         "clockIncrement": clock_increment,
         "duration": duration,
         "start": start,
