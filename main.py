@@ -5,8 +5,9 @@ Lichess Forum Arenas Bot
 Team "Forum Arenas" / Forum "Arena Requests"
 
 Spieler posten ein strukturiertes Key:Value-Template im Forum. Der Bot liest
-neue Posts, parst/validiert die Felder, prüft das Rate-Limit und erstellt ein
-Lichess-Arena-Turnier mit exakt diesen Einstellungen.
+neue Posts, parst/validiert die Felder (sehr tolerant gegenüber unter-
+schiedlichen Schreibweisen, inkl. Zeitzonen), prüft das Rate-Limit und
+erstellt ein Lichess-Arena-Turnier mit exakt diesen Einstellungen.
 
 Erwartetes Format (Beispiel):
 
@@ -18,8 +19,16 @@ Erwartetes Format (Beispiel):
     Time: 18:00
     Rated: yes
 
-Clock akzeptiert auch UltraBullet-Bruchwerte ("1/4+0" / "0.25+0") und
-reines Inkrement ("0+1").
+Akzeptierte Varianten (Beispiele):
+    Clock:    3+2, 3:2, 3-2, 3 2, 1/4+0, 0.25+0
+    Duration: 90, 90min, 1h30, 1.5h, 2 hours, 1:30, 12 HOURS
+    Date:     25.12.2026, 25/12/26, 2026-12-25, 25 December, Aug 16th, Dec 25 2026
+    Time:     18:00, 18.00, 6pm, 6:30 PM, noon, 5 PM EST, 20:00 CET
+    Rated:    yes/y/true/1/rated, no/n/false/0/casual/unrated
+
+Zeitzonen (EST, PST, CET, IST, ...) werden erkannt und automatisch nach
+Europe/Berlin umgerechnet. Fehlt eine Zeitzone, wird die Eingabe als
+deutsche Zeit interpretiert.
 
 State (verarbeitete Post-IDs, letzte Forumsseite, Rate-Limit-Nutzung) wird
 in data/state.json gespeichert. Der Workflow committet diese Datei nach
@@ -30,12 +39,15 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup, NavigableString
+from dateutil import parser as dateparser
+from dateutil import tz as dateutil_tz
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -52,10 +64,15 @@ TZ = ZoneInfo("Europe/Berlin")
 MAX_TOURNAMENTS_PER_USER_PER_DAY = 3
 
 # Mindest-Vorlaufzeit zwischen "jetzt" (Verarbeitungszeitpunkt) und Turnierstart.
-# Verhindert, dass knapp getimte Anfragen durch die Verzögerung zwischen
-# Posten und Cron-Durchlauf fälschlich als "in der Vergangenheit" abgelehnt
-# werden bzw. dass Lichess den Request wegen zu kurzer Vorlaufzeit ablehnt.
 MIN_LEAD_MINUTES = 1
+
+# Lichess-Grenzen für Arena-Turniere
+MIN_DURATION_MINUTES = 10
+MAX_DURATION_MINUTES = 720  # 12 Stunden
+
+# Schutz gegen Burst-Spam: max. so viele neue Posts pro Workflow-Lauf
+# verarbeiten (Rest wird beim nächsten Lauf abgearbeitet)
+MAX_POSTS_PER_RUN = 25
 
 # Feste Turnier-Beschreibung. "This arena was requested by @Username" wird
 # automatisch VOR diesen Text gesetzt - hier nur den Rest nach Belieben anpassen.
@@ -65,22 +82,22 @@ DESCRIPTION_TEMPLATE = (
 )
 
 VARIANT_MAP = {
-    "standard": "standard",
-    "chess960": "chess960",
-    "960": "chess960",
-    "crazyhouse": "crazyhouse",
-    "antichess": "antichess",
+    "standard": "standard", "chess": "standard", "normal": "standard",
+    "chess960": "chess960", "960": "chess960", "fischerandom": "chess960",
+    "fischer random": "chess960", "fischer": "chess960",
+    "crazyhouse": "crazyhouse", "house": "crazyhouse", "zh": "crazyhouse",
+    "crazy house": "crazyhouse",
+    "antichess": "antichess", "anti": "antichess", "losers": "antichess",
+    "anti chess": "antichess", "giveaway": "antichess",
     "atomic": "atomic",
     "horde": "horde",
-    "kingofthehill": "kingOfTheHill",
-    "king of the hill": "kingOfTheHill",
-    "koth": "kingOfTheHill",
-    "racingkings": "racingKings",
-    "racing kings": "racingKings",
-    "threecheck": "threeCheck",
-    "three-check": "threeCheck",
-    "three check": "threeCheck",
-    "3check": "threeCheck",
+    "kingofthehill": "kingOfTheHill", "king of the hill": "kingOfTheHill",
+    "koth": "kingOfTheHill", "kingofhill": "kingOfTheHill",
+    "racingkings": "racingKings", "racing kings": "racingKings",
+    "racingking": "racingKings", "racing king": "racingKings",
+    "threecheck": "threeCheck", "three check": "threeCheck",
+    "3check": "threeCheck", "3-check": "threeCheck",
+    "3 check": "threeCheck", "threecheckchess": "threeCheck",
 }
 
 # Von Lichess erlaubte clockTime-Werte (Minuten), inkl. UltraBullet-Bruchwerte
@@ -89,6 +106,42 @@ ALLOWED_CLOCK_TIMES = {
     0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10,
     15, 20, 25, 30, 40, 50, 60,
 }
+
+RATED_TRUE_VALUES = {"yes", "y", "true", "1", "rated", "ja"}
+RATED_FALSE_VALUES = {"no", "n", "false", "0", "casual", "unrated", "nein"}
+
+# Häufige Zeitzonen-Abkürzungen -> UTC-Offset in Stunden. dateutil kennt
+# diese Kürzel nicht zuverlässig von selbst (viele sind mehrdeutig),
+# daher explizite Zuordnung. Bei Bedarf einfach weitere ergänzen.
+TZ_ABBREVIATIONS_HOURS = {
+    "UTC": 0, "GMT": 0,
+    "CET": 1, "CEST": 2, "BST": 1, "WET": 0, "WEST": 1,
+    "EST": -5, "EDT": -4,
+    "CST": -6, "CDT": -5,
+    "MST": -7, "MDT": -6,
+    "PST": -8, "PDT": -7,
+    "AEST": 10, "AEDT": 11,
+    "ACST": 9.5, "ACDT": 10.5,
+    "AWST": 8,
+    "NZST": 12, "NZDT": 13,
+    "IST": 5.5,  # India Standard Time
+    "JST": 9,
+    "KST": 9,
+    "MSK": 3,
+    "EET": 2, "EEST": 3,
+}
+
+
+def _build_tzinfos():
+    tzinfos = {}
+    for name, hours in TZ_ABBREVIATIONS_HOURS.items():
+        tzinfos[name] = dateutil_tz.tzoffset(name, int(hours * 3600))
+    return tzinfos
+
+
+TZINFOS = _build_tzinfos()
+
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 POST_LINK_RE = re.compile(r"^/@/([\w-]+)$")
 # ?page=N ist optional - auf Seite 1 lässt Lichess den Query-Parameter weg
@@ -104,10 +157,19 @@ if TOKEN:
 # Forum scrapen (Lesen)
 # ---------------------------------------------------------------------------
 
-def fetch_page(page: int) -> str:
-    res = session.get(f"{FORUM_BASE}?page={page}", timeout=30)
-    res.raise_for_status()
-    return res.text
+def fetch_page(page: int, retries: int = 3) -> str:
+    """Holt eine Forumsseite, mit kurzem Retry bei transienten Netzwerkfehlern."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            res = session.get(f"{FORUM_BASE}?page={page}", timeout=30)
+            res.raise_for_status()
+            return res.text
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(2 * attempt)
+    raise last_err
 
 
 def get_max_page(html: str) -> int:
@@ -170,8 +232,17 @@ class ValidationError(Exception):
     pass
 
 
+def normalize_text(text: str) -> str:
+    """Entfernt unsichtbare/Sonderleerzeichen, die beim Copy-Paste (v.a. mobil)
+    oft mitkopiert werden und Regex-Matches sonst stillschweigend brechen."""
+    text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = text.replace("\xa0", " ").replace("\u3000", " ")
+    return text
+
+
 def parse_fields(text: str) -> dict:
     """Extrahiert Key:Value-Paare aus dem Post-Text, egal in welcher Reihenfolge."""
+    text = normalize_text(text)
     fields = {}
     for line in text.splitlines():
         m = re.match(r"\s*([A-Za-z]+)\s*:\s*(.+?)\s*$", line)
@@ -182,9 +253,26 @@ def parse_fields(text: str) -> dict:
     return fields
 
 
+# --- Clock -------------------------------------------------------------
+
+def parse_clock_field(raw: str):
+    """Trennt 'TIME<sep>INCREMENT' - Trennzeichen: '+', ':', '-' oder Leerzeichen."""
+    raw = raw.strip()
+
+    m = re.match(r"^(.+?)\s*[+:\-]\s*(\d+)$", raw)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    parts = raw.split()
+    if len(parts) == 2:
+        return parts[0], parts[1]
+
+    return None
+
+
 def parse_clock_time(raw: str) -> float:
     """Akzeptiert '3', '0', '0.25' oder '1/4' (Bruch) als Minutenangabe."""
-    raw = raw.strip()
+    raw = raw.strip().replace(",", ".")
 
     frac_match = re.match(r"^(\d+)\s*/\s*(\d+)$", raw)
     if frac_match:
@@ -205,6 +293,91 @@ def format_clock_time(value: float) -> str:
     if value == int(value):
         return str(int(value))
     return str(value)
+
+
+# --- Duration --------------------------------------------------------------
+
+def parse_duration_minutes(raw: str) -> int:
+    """
+    Akzeptiert u.a.: '90', '90min', '90 minutes', '1h30', '1h30m',
+    '1.5h', '2 hours', '12 HOURS', '1:30'.
+    """
+    raw = raw.strip().lower().replace(",", ".")
+
+    if re.match(r"^\d+$", raw):
+        return int(raw)
+
+    m = re.match(r"^(\d+)\s*h\s*(\d{1,2})\s*m?$", raw)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+
+    m = re.match(r"^(\d+):(\d{2})$", raw)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+
+    total = 0.0
+    found = False
+
+    h_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours|std|stunden|stunde)\b", raw)
+    if h_match:
+        total += float(h_match.group(1)) * 60
+        found = True
+
+    m_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b", raw)
+    if m_match:
+        total += float(m_match.group(1))
+        found = True
+
+    if found:
+        return round(total)
+
+    raise ValueError(f"unrecognized duration format '{raw}'")
+
+
+# --- Date + Time -------------------------------------------------------
+
+def parse_date_time(date_str: str, time_str: str, now: datetime) -> datetime:
+    """
+    Nutzt python-dateutil, um sehr viele Datums-/Zeitschreibweisen zu
+    akzeptieren (numerisch, Monatsnamen, mit/ohne Jahr, 12h/24h, mit/ohne
+    Zeitzonen-Abkürzung wie EST/PST/CET usw.). Ist eine Zeitzone erkannt,
+    wird automatisch nach Europe/Berlin umgerechnet. Ohne erkannte Zeitzone
+    wird die Eingabe als bereits deutsche Zeit interpretiert.
+    """
+    combined = f"{date_str} {time_str}".strip()
+
+    try:
+        parsed = dateparser.parse(
+            combined,
+            dayfirst=True,
+            fuzzy=True,
+            tzinfos=TZINFOS,
+            default=datetime(now.year, 1, 1, 0, 0),
+        )
+    except (ValueError, OverflowError):
+        raise ValidationError(
+            f"couldn't understand 'Date'/'Time' values '{date_str}' / '{time_str}'. "
+            f"Try formats like '25.12.2026' + '18:00', or 'Aug 16th' + '5 PM EST'."
+        )
+
+    if parsed is None:
+        raise ValidationError(
+            f"couldn't understand 'Date'/'Time' values '{date_str}' / '{time_str}'."
+        )
+
+    if parsed.tzinfo is not None:
+        # Zeitzone wurde erkannt -> nach Europe/Berlin umrechnen
+        start = parsed.astimezone(TZ)
+    else:
+        # Keine Zeitzone erkannt -> als deutsche Zeit interpretieren
+        start = parsed.replace(tzinfo=TZ)
+
+    # Kein Jahr angegeben und Datum liegt (in diesem Jahr) schon in der
+    # Vergangenheit -> automatisch aufs nächste Jahr verschieben
+    if not YEAR_RE.search(date_str) and start < now:
+        start = start.replace(year=start.year + 1)
+
+    return start
 
 
 def parse_request(text: str) -> dict:
@@ -246,30 +419,33 @@ def parse_request(text: str) -> dict:
             f"King of the Hill, Racing Kings, Three-check."
         )
 
-    # --- Clock (z.B. "3+2", "0+1", "1/4+0", "0.25+0" für UltraBullet) ---
-    clock_match = re.match(r"^(.+?)\s*\+\s*(\d+)$", fields["clock"].strip())
-    if not clock_match:
+    # --- Clock ---
+    clock_parts = parse_clock_field(fields["clock"])
+    if clock_parts is None:
         raise ValidationError(
             f"invalid 'Clock' value '{fields['clock']}'. "
-            f"Use the format TIME+INCREMENT, e.g. '3+2', '0+1', or '1/4+0' / '0.25+0' for UltraBullet."
+            f"Use TIME+INCREMENT, e.g. '3+2', '3:2', '3-2', '0+1', or '1/4+0' / '0.25+0' for UltraBullet."
         )
+    time_part, inc_part = clock_parts
 
     try:
-        clock_time = parse_clock_time(clock_match.group(1))
+        clock_time = parse_clock_time(time_part)
     except ValueError:
         raise ValidationError(
-            f"invalid 'Clock' time value '{clock_match.group(1)}'. "
+            f"invalid 'Clock' time value '{time_part}'. "
             f"Use a whole number, a decimal (e.g. 0.25), or a fraction (e.g. 1/4)."
         )
 
-    clock_increment = int(clock_match.group(2))
+    if not re.match(r"^\d+$", inc_part):
+        raise ValidationError(f"invalid 'Clock' increment value '{inc_part}'. Must be a whole number.")
+    clock_increment = int(inc_part)
 
     if not any(abs(clock_time - allowed) < 0.001 for allowed in ALLOWED_CLOCK_TIMES):
         allowed_str = ", ".join(
             str(int(v)) if v == int(v) else str(v) for v in sorted(ALLOWED_CLOCK_TIMES)
         )
         raise ValidationError(
-            f"invalid 'Clock' time '{clock_match.group(1)}'. Allowed values: {allowed_str} "
+            f"invalid 'Clock' time '{time_part}'. Allowed values: {allowed_str} "
             f"(minutes; use 1/4 or 0.25 for UltraBullet)."
         )
 
@@ -279,45 +455,40 @@ def parse_request(text: str) -> dict:
     if not (0 <= clock_increment <= 60):
         raise ValidationError("'Clock' increment out of allowed range (0-60).")
 
-    # --- Duration (Minuten) ---
-    if not re.match(r"^\d+$", fields["duration"].strip()):
-        raise ValidationError(f"invalid 'Duration' value '{fields['duration']}'. Must be a number in minutes.")
-    duration = int(fields["duration"].strip())
-    if not (10 <= duration <= 720):
-        raise ValidationError("'Duration' must be between 10 and 720 minutes.")
-    # --- Date + Time -> Startdatum in Europe/Berlin ---
-    date_str = fields["date"].strip()
-    time_str = fields["time"].strip()
-
-    dm = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", date_str)
-    if not dm:
-        raise ValidationError(f"invalid 'Date' value '{date_str}'. Use the format DD.MM.YYYY, e.g. 25.12.2026.")
-    day, month, year = int(dm.group(1)), int(dm.group(2)), int(dm.group(3))
-
-    tm = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
-    if not tm:
-        raise ValidationError(f"invalid 'Time' value '{time_str}'. Use 24h format HH:MM, e.g. 18:00.")
-    hour, minute = int(tm.group(1)), int(tm.group(2))
-
+    # --- Duration ---
     try:
-        start = datetime(year, month, day, hour, minute, tzinfo=TZ)
+        duration = parse_duration_minutes(fields["duration"])
     except ValueError:
-        raise ValidationError(f"'{date_str} {time_str}' is not a valid date/time.")
+        raise ValidationError(
+            f"invalid 'Duration' value '{fields['duration']}'. "
+            f"Try formats like 90, 90min, 1h30, 1.5h, or 2 hours."
+        )
+    if not (MIN_DURATION_MINUTES <= duration <= MAX_DURATION_MINUTES):
+        raise ValidationError(
+            f"'Duration' must be between {MIN_DURATION_MINUTES} and {MAX_DURATION_MINUTES} minutes."
+        )
 
+    # --- Date + Time -> Startdatum in Europe/Berlin (Zeitzonen werden erkannt) ---
     now = datetime.now(TZ)
+    start = parse_date_time(fields["date"], fields["time"], now)
+
     min_start = now + timedelta(minutes=MIN_LEAD_MINUTES)
     if start < min_start:
         raise ValidationError(
             f"the requested start ({start.strftime('%d.%m.%Y %H:%M')} German time) is too soon "
-            f"or in the past. Please choose a time at least {MIN_LEAD_MINUTES} minutes from now "
-            f"to account for processing delay."
+            f"or in the past. Please choose a time at least {MIN_LEAD_MINUTES} minute(s) from now."
         )
 
     # --- Rated ---
     rated_raw = fields["rated"].strip().lower()
-    if rated_raw not in ("yes", "no"):
-        raise ValidationError(f"invalid 'Rated' value '{fields['rated']}'. Use 'yes' or 'no'.")
-    rated = rated_raw == "yes"
+    if rated_raw in RATED_TRUE_VALUES:
+        rated = True
+    elif rated_raw in RATED_FALSE_VALUES:
+        rated = False
+    else:
+        raise ValidationError(
+            f"invalid 'Rated' value '{fields['rated']}'. Use 'yes' or 'no'."
+        )
 
     return {
         "name": name,
@@ -398,6 +569,8 @@ def load_state() -> dict:
         return {"lastPage": 1, "processedIds": [], "usage": {}}
     state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     state.setdefault("usage", {})
+    state.setdefault("lastPage", 1)
+    state.setdefault("processedIds", [])
     return state
 
 
@@ -436,6 +609,16 @@ def main():
 
     if not new_posts:
         print("No new requests found.")
+        save_state(state)
+        return
+
+    if len(new_posts) > MAX_POSTS_PER_RUN:
+        print(f"{len(new_posts)} new posts found, processing only the first "
+              f"{MAX_POSTS_PER_RUN} this run (rest will be handled next run).")
+        new_posts = new_posts[:MAX_POSTS_PER_RUN]
+
+    created_count = 0
+    rejected_count = 0
 
     for post in new_posts:
         username = post["username"]
@@ -446,12 +629,14 @@ def main():
             req = parse_request(post["text"])
         except ValidationError as e:
             print(f"   ✗ Invalid request: {e}")
+            rejected_count += 1
             state["processedIds"].append(post["post_id"])
             continue
         except Exception as e:
             # Absicherung gegen unerwartete Parsing-Fehler, damit ein einzelner
             # kaputter Post nicht den ganzen Workflow-Lauf abbrechen lässt.
             print(f"   ✗ Unexpected parsing error: {e}", file=sys.stderr)
+            rejected_count += 1
             state["processedIds"].append(post["post_id"])
             continue
 
@@ -459,6 +644,7 @@ def main():
         used = user_tournament_count_today(state, username)
         if used >= MAX_TOURNAMENTS_PER_USER_PER_DAY:
             print(f"   ✗ Rate limit reached ({used}/{MAX_TOURNAMENTS_PER_USER_PER_DAY} today)")
+            rejected_count += 1
             state["processedIds"].append(post["post_id"])
             continue
 
@@ -466,12 +652,19 @@ def main():
         try:
             create_tournament(req, username)
             record_tournament_created(state, username)
+            created_count += 1
         except Exception as e:
             print(f"   ✗ Error creating tournament: {e}", file=sys.stderr)
+            rejected_count += 1
 
         state["processedIds"].append(post["post_id"])
+        # kleine Pause zwischen API-Calls, um Rate-Limits bei mehreren
+        # Turnieren in einem Lauf nicht zu triggern
+        time.sleep(1)
 
     save_state(state)
+    print(f"Done. Created: {created_count}, Rejected: {rejected_count}, "
+          f"Total new posts seen: {len(new_posts)}")
 
 
 if __name__ == "__main__":
