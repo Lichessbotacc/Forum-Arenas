@@ -1,5 +1,5 @@
 {
-  "lastPage": 3,
+  "lastPage": 4,
   "processedIds": [
     "DbegWwAf",
     "3ZdBvcL7",
@@ -30,7 +30,8 @@
     "eskEhatO",
     "cl21GOpz",
     "lAl3Gujj",
-    "oHAUWRao"
+    "oHAUWRao",
+    "Yv2xwGLl"
   ],
   "usage": {
     "darkoncrack": {
@@ -47,6 +48,9 @@
     },
     "pro_atchess": {
       "2026-08-07": 1
+    },
+    "chessclassic_555": {
+      "2026-08-08": 1
     }
   }
 }
