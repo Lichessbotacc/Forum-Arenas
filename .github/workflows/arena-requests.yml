@@ -2,7 +2,7 @@ name: Forum Arena Requests
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # alle 10 Minuten - Nutzer wollen zeitnahe Bestätigung
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install requests beautifulsoup4 python-dateutil
 
       - name: Check forum & create arenas
         env:
