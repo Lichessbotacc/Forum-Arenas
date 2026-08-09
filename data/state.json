@@ -1,5 +1,5 @@
 {
-  "lastPage": 10,
+  "lastPage": 11,
   "processedIds": [
     "DbegWwAf",
     "3ZdBvcL7",
@@ -100,7 +100,9 @@
     "Gtgp6zxm",
     "Cd6U3QPq",
     "5LDvQ6dN",
-    "7VWnukeC"
+    "7VWnukeC",
+    "1edrlEfy",
+    "TxPL0SUh"
   ],
   "usage": {
     "darkoncrack": {
@@ -146,7 +148,7 @@
       "2026-08-09": 1
     },
     "sjisland_the_zerker": {
-      "2026-08-09": 1
+      "2026-08-09": 2
     }
   }
 }
