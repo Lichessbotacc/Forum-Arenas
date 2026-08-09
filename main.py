@@ -338,47 +338,88 @@ def parse_duration_minutes(raw: str) -> int:
 
 def parse_date_time(date_str: str, time_str: str, now: datetime) -> datetime:
     """
-    Nutzt python-dateutil, um sehr viele Datums-/Zeitschreibweisen zu
-    akzeptieren (numerisch, Monatsnamen, mit/ohne Jahr, 12h/24h, mit/ohne
-    Zeitzonen-Abkürzung wie EST/PST/CET usw.). Ist eine Zeitzone erkannt,
-    wird automatisch nach Europe/Berlin umgerechnet. Ohne erkannte Zeitzone
-    wird die Eingabe als bereits deutsche Zeit interpretiert.
-    """
-    combined = f"{date_str} {time_str}".strip()
+    Parst Datum und Uhrzeit GETRENNT (nicht als kombinierten String), da
+    dateutil sonst z.B. "13.10" fälschlich als Dezimalzahl statt als
+    Tag.Monat interpretieren kann, wenn es zusammen mit der Uhrzeit steht.
 
+    Für eindeutige numerische Datumsformate wird zuerst eine exakte Regex
+    versucht (zuverlässiger). Nur für Wortformate (z.B. "Aug 16th") wird auf
+    die tolerante dateutil-Fuzzy-Erkennung zurückgegriffen.
+    """
+    date_str_clean = date_str.strip()
+
+    day = month = year = None
+
+    # 1) Exakte numerische Formate: DD.MM(.YYYY), DD/MM(/YYYY), DD-MM(-YYYY)
+    m = re.match(r"^(\d{1,2})[./\-](\d{1,2})(?:[./\-](\d{2,4}))?$", date_str_clean)
+    if m:
+        day = int(m.group(1))
+        month = int(m.group(2))
+        if m.group(3):
+            year = int(m.group(3))
+            if year < 100:
+                year += 2000
+
+    # 2) ISO-Format: YYYY-MM-DD
+    if day is None:
+        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", date_str_clean)
+        if m:
+            year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+    # 3) Fallback: dateutil-Fuzzy-Erkennung (Monatsnamen, "Aug 16th" usw.)
+    if day is None:
+        try:
+            date_parsed = dateparser.parse(
+                date_str_clean, dayfirst=True, fuzzy=True,
+                default=datetime(now.year, 1, 1),
+            )
+        except (ValueError, OverflowError):
+            date_parsed = None
+
+        if date_parsed is None:
+            raise ValidationError(
+                f"couldn't understand 'Date' value '{date_str}'. Try formats "
+                f"like 25.12.2026, 25/12/2026, 2026-12-25, or '25 December'."
+            )
+        day, month = date_parsed.day, date_parsed.month
+        if YEAR_RE.search(date_str_clean):
+            year = date_parsed.year
+
+    if year is None:
+        year = now.year
+
+    # --- Uhrzeit separat parsen (inkl. optionaler Zeitzonen-Abkürzung) ---
     try:
-        parsed = dateparser.parse(
-            combined,
-            dayfirst=True,
-            fuzzy=True,
-            tzinfos=TZINFOS,
-            default=datetime(now.year, 1, 1, 0, 0),
+        time_parsed = dateparser.parse(
+            time_str, fuzzy=True, tzinfos=TZINFOS,
+            default=datetime(2000, 1, 1, 0, 0),
         )
     except (ValueError, OverflowError):
+        time_parsed = None
+
+    if time_parsed is None:
         raise ValidationError(
-            f"couldn't understand 'Date'/'Time' values '{date_str}' / '{time_str}'. "
-            f"Try formats like '25.12.2026' + '18:00', or 'Aug 16th' + '5 PM EST'."
+            f"couldn't understand 'Time' value '{time_str}'. Try formats "
+            f"like 18:00, 6:30pm, or 5 PM EST."
         )
 
-    if parsed is None:
-        raise ValidationError(
-            f"couldn't understand 'Date'/'Time' values '{date_str}' / '{time_str}'."
-        )
+    try:
+        naive_start = datetime(year, month, day, time_parsed.hour, time_parsed.minute)
+    except ValueError:
+        raise ValidationError(f"'{date_str} {time_str}' is not a valid date/time.")
 
-    if parsed.tzinfo is not None:
-        # Zeitzone wurde erkannt -> nach Europe/Berlin umrechnen
-        start = parsed.astimezone(TZ)
+    if time_parsed.tzinfo is not None:
+        # Zeitzone wurde in der Uhrzeit erkannt -> umrechnen nach Europe/Berlin
+        start = naive_start.replace(tzinfo=time_parsed.tzinfo).astimezone(TZ)
     else:
         # Keine Zeitzone erkannt -> als deutsche Zeit interpretieren
-        start = parsed.replace(tzinfo=TZ)
+        start = naive_start.replace(tzinfo=TZ)
 
-    # Kein Jahr angegeben und Datum liegt (in diesem Jahr) schon in der
-    # Vergangenheit -> automatisch aufs nächste Jahr verschieben
-    if not YEAR_RE.search(date_str) and start < now:
+    # Kein Jahr angegeben und Datum liegt schon in der Vergangenheit -> nächstes Jahr
+    if not YEAR_RE.search(date_str_clean) and start < now:
         start = start.replace(year=start.year + 1)
 
     return start
-
 
 def parse_request(text: str) -> dict:
     """Wirft ValidationError mit verständlicher Meldung, wenn etwas fehlt/ungültig ist."""
